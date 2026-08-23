@@ -33,6 +33,7 @@ jobs:
           BOT_TIMEZONE: Australia/Brisbane
           TAB_JURISDICTION: NSW
           MAX_RACES: ${{ github.event.inputs.max_races || '8' }}
+          PUNTERSEDGE_API_KEY: ${{ secrets.PUNTERSEDGE_API_KEY }}
         run: python predictor.py
 
       - name: Put predictions in GitHub summary
