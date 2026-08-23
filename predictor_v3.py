@@ -1,107 +1,191 @@
-import json, math, os, re, statistics, sys
+import json
+import math
+import os
+import re
+import statistics
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
 import requests
 
-API = "https://api.puntersedge.online/v1/racing/next-to-go"
-MOVERS = "https://api.puntersedge.online/v1/racing/movers"
-KEY = os.getenv("PUNTERSEDGE_API_KEY", "").strip()
-TZ = os.getenv("BOT_TIMEZONE", "Australia/Brisbane").strip()
+API_URL = "https://api.puntersedge.online/v1/racing/next-to-go"
+MOVERS_URL = "https://api.puntersedge.online/v1/racing/movers"
+API_KEY = os.getenv("PUNTERSEDGE_API_KEY", "").strip()
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Australia/Brisbane").strip()
 
 try:
-    MAX_RACES = int(os.getenv("MAX_RACES", "8"))
+    MAX_DISPLAY = int(os.getenv("MAX_RACES", "8"))
 except ValueError:
-    MAX_RACES = 8
+    MAX_DISPLAY = 8
 
-MAX_RACES = max(1, min(20, MAX_RACES))
+MAX_DISPLAY = max(1, min(20, MAX_DISPLAY))
+FETCH_RACES = 50
 
 Path("debug").mkdir(exist_ok=True)
 
 
-def num(v):
+# ============================================================
+# HELPERS
+# ============================================================
+
+def num(value):
     try:
-        x = float(v)
-        return x if math.isfinite(x) else None
+        value = float(value)
+        return value if math.isfinite(value) else None
     except (TypeError, ValueError):
         return None
 
 
-def save(path, data):
+def save_json(path, data):
     Path(path).write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8"
+        json.dumps(
+            data,
+            indent=2,
+            ensure_ascii=False,
+            default=str
+        ),
+        encoding="utf-8",
     )
 
 
 def local_time(value):
+    if not value:
+        return "Time N/A"
+
     try:
         dt = datetime.fromisoformat(
-            str(value).replace("Z", "+00:00")
+            str(value).replace(
+                "Z",
+                "+00:00"
+            )
         )
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
         return dt.astimezone(
-            ZoneInfo(TZ)
-        ).strftime("%a %d %b %I:%M %p")
+            ZoneInfo(BOT_TIMEZONE)
+        ).strftime(
+            "%a %d %b %I:%M %p"
+        )
 
     except Exception:
-        return str(value or "Time N/A")
+        return str(value)
 
 
-def form_list(form):
-
-    values = (
-        form
-        if isinstance(form, list)
-        else re.findall(r"[1-8]", str(form or ""))
+def race_label(race):
+    distance = (
+        f" · {race.get('distance_m')}m"
+        if race.get("distance_m")
+        else ""
     )
+
+    return (
+        f"{race.get('venue') or 'Unknown venue'} "
+        f"R{race.get('race_number') or '?'}"
+        f"{distance} · "
+        f"{local_time(race.get('start_time'))}"
+    )
+
+
+# ============================================================
+# FORM
+# ============================================================
+
+def form_positions(form):
+
+    if form in (
+        None,
+        "",
+        []
+    ):
+        return []
+
+    if isinstance(
+        form,
+        list
+    ):
+        raw = form
+
+    else:
+        raw = re.findall(
+            r"[1-8]",
+            str(form)
+        )
 
     out = []
 
-    for v in values:
+    for value in raw:
+
         try:
-            n = int(v)
+            value = int(value)
 
-            if 1 <= n <= 8:
-                out.append(n)
+            if 1 <= value <= 8:
+                out.append(value)
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError
+        ):
             pass
 
     return out[-5:]
 
 
+def form_text(form):
+
+    values = form_positions(
+        form
+    )
+
+    if not values:
+        return "N/A"
+
+    return "".join(
+        map(
+            str,
+            values
+        )
+    )
+
+
 def form_score(form):
 
-    results = form_list(form)
+    values = form_positions(
+        form
+    )
 
-    if not results:
+    if not values:
         return 0.50
 
-    value = {
+    score_map = {
         1: 1.00,
-        2: .84,
-        3: .70,
-        4: .56,
-        5: .43,
-        6: .32,
-        7: .23,
-        8: .16,
+        2: 0.84,
+        3: 0.70,
+        4: 0.56,
+        5: 0.43,
+        6: 0.32,
+        7: 0.23,
+        8: 0.16,
     }
 
-    weights = range(
-        1,
-        len(results) + 1
+    weights = list(
+        range(
+            1,
+            len(values) + 1
+        )
     )
 
     return (
         sum(
-            value[p] * w
-            for p, w in zip(
-                results,
+            score_map[position] * weight
+            for position, weight
+            in zip(
+                values,
                 weights
             )
         )
@@ -110,207 +194,210 @@ def form_score(form):
     )
 
 
-def form_text(form):
+# ============================================================
+# BOOKMAKER PRICES
+# ============================================================
 
-    x = form_list(form)
+def is_sportsbet(value):
 
-    return (
-        "".join(
-            map(str, x)
-        )
-        if x
-        else "N/A"
+    cleaned = re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(
+            value or ""
+        ).lower()
     )
-
-
-def sportsbet(key):
 
     return (
         "sportsbet"
-        in str(
-            key or ""
-        ).lower().replace(
-            " ",
-            ""
-        )
+        in cleaned
     )
 
 
-def quotes(runner):
+def fresh_quotes(runner):
 
-    out = []
+    quotes = []
 
-    for b in runner.get(
-        "bookmakers"
-    ) or []:
+    for book in (
+        runner.get(
+            "bookmakers"
+        )
+        or []
+    ):
 
         if not isinstance(
-            b,
+            book,
             dict
         ):
             continue
 
         price = num(
-            b.get(
+            book.get(
                 "win_price"
             )
         )
 
         age = num(
-            b.get(
+            book.get(
                 "age_seconds"
             )
         )
 
+        if not price:
+            continue
+
+        if price <= 1:
+            continue
+
+        if book.get(
+            "stale"
+        ):
+            continue
+
         if (
-            not price
-            or price <= 1
-            or b.get("stale")
-            or (
-                age is not None
-                and age > 120
-            )
+            age is not None
+            and age > 120
         ):
             continue
 
         key = str(
-            b.get("key")
-            or b.get("name")
-            or b.get("title")
+            book.get("key")
+            or book.get("name")
+            or book.get("title")
             or "unknown"
         )
 
-        out.append({
+        name = str(
+            book.get("title")
+            or book.get("name")
+            or book.get("key")
+            or "Unknown"
+        )
 
-            "key":
-                key,
+        quotes.append(
+            {
+                "key": key,
+                "name": name,
+                "price": price,
+                "age": age,
+            }
+        )
 
-            "name":
-                str(
-                    b.get("title")
-                    or b.get("name")
-                    or key
-                ),
+    return quotes
 
-            "price":
-                price,
 
-            "age":
-                age,
-
-        })
-
-    return out
-
+# ============================================================
+# API
+# ============================================================
 
 def api_get(
     url,
-    params,
+    params=None,
     required=True
 ):
 
-    if not KEY:
+    if not API_KEY:
 
         raise RuntimeError(
-            "PUNTERSEDGE_API_KEY is missing."
+            "PUNTERSEDGE_API_KEY is missing. "
+            "Check the GitHub repository secret."
         )
 
-    r = requests.get(
+    response = requests.get(
 
         url,
 
-        params=params,
+        params=(
+            params
+            or {}
+        ),
 
         headers={
-
             "X-API-Key":
-                KEY,
+                API_KEY,
 
             "Accept":
                 "application/json",
 
-            "Accept-Encoding":
-                "gzip",
-
             "User-Agent":
-                "greyhound-ai-predictor/3.0",
-
+                "greyhound-ai-predictor/3.1",
         },
 
         timeout=30,
-
     )
 
     try:
-        data = r.json()
+        data = response.json()
 
     except ValueError:
 
         data = {
             "raw_text":
-                r.text[:3000]
+                response.text[:5000]
         }
 
-    if r.status_code != 200:
+    if response.status_code != 200:
 
         if required:
 
             raise RuntimeError(
                 f"PuntersEdge HTTP "
-                f"{r.status_code}: "
+                f"{response.status_code}: "
                 f"{data}"
             )
 
-        return None, r.status_code
+        return (
+            None,
+            response.status_code
+        )
 
-    return data, r.status_code
+    return (
+        data,
+        response.status_code
+    )
 
 
 def fetch_data():
 
     races, _ = api_get(
 
-        API,
+        API_URL,
 
         {
             "categories":
                 "greyhound",
 
             "num_races":
-                50,
-        }
+                FETCH_RACES,
+        },
+
+        required=True,
     )
 
-    save(
+    save_json(
         "debug/puntersedge_races.json",
         races
     )
 
+    # Movers are optional.
+    # If the user's plan does not provide this endpoint,
+    # the predictor continues without failing.
+
     movers, status = api_get(
 
-        MOVERS,
+        MOVERS_URL,
 
         {
             "categories":
-                "greyhound",
-
-            "min_move_pct":
-                3,
-
-            "min_books":
-                2,
-
-            "max_mins_to_jump":
-                360,
-
-            "limit":
-                200,
+                "greyhound"
         },
 
         required=False,
     )
 
     if movers is None:
+
+        movers = []
 
         Path(
             "debug/movers_status.txt"
@@ -319,17 +406,16 @@ def fetch_data():
             (
                 f"Movers unavailable "
                 f"(HTTP {status}); "
-                f"V3 continued without it.\n"
+                f"continued without "
+                f"movement adjustment.\n"
             ),
 
-            encoding="utf-8"
+            encoding="utf-8",
         )
-
-        movers = []
 
     else:
 
-        save(
+        save_json(
             "debug/puntersedge_movers.json",
             movers
         )
@@ -340,49 +426,33 @@ def fetch_data():
     ):
 
         raise RuntimeError(
-            "Unexpected next-to-go response."
+            "Unexpected next-to-go response; "
+            "expected a list of races."
         )
+
+    if not isinstance(
+        movers,
+        list
+    ):
+        movers = []
 
     return (
         races,
         movers
-        if isinstance(
-            movers,
-            list
-        )
-        else []
     )
 
 
-def mkey(
-    venue,
-    race_no,
-    runner
-):
+# ============================================================
+# AUSTRALIAN / INTERNATIONAL CLASSIFICATION
+# ============================================================
 
-    return (
-
-        str(
-            venue or ""
-        ).strip().lower(),
-
-        str(
-            race_no or ""
-        ).strip(),
-
-        str(
-            runner or ""
-        ).strip().lower(),
-
-    )
-
-
-def local_race(race):
+def enriched_race(race):
 
     country = str(
         race.get(
             "country"
-        ) or ""
+        )
+        or ""
     ).upper()
 
     if country in {
@@ -394,9 +464,17 @@ def local_race(race):
     if country:
         return False
 
+    # Some Australian races can temporarily
+    # arrive with no country label.
+    #
+    # Presence of form/barrier/trainer data
+    # strongly suggests an enriched AU/NZ race.
+
     return any(
 
-        r.get("form")
+        runner.get(
+            "form"
+        )
         not in (
             None,
             "",
@@ -405,220 +483,420 @@ def local_race(race):
 
         or
 
-        r.get(
+        runner.get(
             "barrier"
-        ) is not None
+        )
+        is not None
 
-        for r
-        in race.get(
-            "runners"
-        ) or []
+        or
 
+        runner.get(
+            "box"
+        )
+        is not None
+
+        or
+
+        runner.get(
+            "trainer"
+        )
+        not in (
+            None,
+            ""
+        )
+
+        for runner
+        in (
+            race.get(
+                "runners"
+            )
+            or []
+        )
     )
 
 
-def analyse(
-    race,
-    mover_index
+# ============================================================
+# MARKET MOVEMENT
+# ============================================================
+
+def mover_key(
+    venue,
+    race_number,
+    runner_name
 ):
 
-    runners = []
+    return (
 
-    for r in (
-        race.get(
-            "runners"
-        ) or []
-    ):
+        str(
+            venue or ""
+        ).strip().lower(),
 
-        qs = quotes(r)
+        str(
+            race_number or ""
+        ).strip(),
 
-        if not qs:
+        str(
+            runner_name or ""
+        ).strip().lower(),
+    )
+
+
+def build_mover_index(
+    movers
+):
+
+    index = {}
+
+    for item in movers:
+
+        if not isinstance(
+            item,
+            dict
+        ):
             continue
 
-        runners.append({
+        venue = item.get(
+            "venue"
+        )
 
-            "number":
-                r.get(
-                    "number"
-                ),
+        race_number = item.get(
+            "race_number"
+        )
 
-            "name":
-                str(
-                    r.get(
-                        "name"
-                    )
-                    or
-                    "Unknown Runner"
-                ),
+        runner = (
 
-            "box":
-                (
-                    r.get(
-                        "barrier"
-                    )
+            item.get(
+                "runner"
+            )
 
-                    if r.get(
-                        "barrier"
-                    ) is not None
+            or
 
-                    else r.get(
-                        "box"
-                    )
-                ),
+            item.get(
+                "runner_name"
+            )
 
-            "form":
-                r.get(
-                    "form"
-                ),
+            or
 
-            "form_score":
-                form_score(
-                    r.get(
-                        "form"
-                    )
-                ),
+            item.get(
+                "name"
+            )
+        )
 
-            "quotes":
-                qs,
+        if (
+            venue
+            and runner
+        ):
 
-        })
+            index[
+                mover_key(
+                    venue,
+                    race_number,
+                    runner
+                )
+            ] = item
 
-    if len(runners) < 2:
+    return index
+
+
+def mover_pct(item):
+
+    if not item:
         return None
 
-    # Build a fair/de-vigged market for each bookmaker.
-    markets = {}
+    for field in (
+        "move_pct",
+        "consensus_move_pct",
+        "movement_pct",
+        "pct_change",
+    ):
 
-    for i, runner in enumerate(
+        value = num(
+            item.get(
+                field
+            )
+        )
+
+        if value is not None:
+            return value
+
+    return None
+
+
+# ============================================================
+# RUNNER DATA
+# ============================================================
+
+def runner_rows(race):
+
+    rows = []
+
+    for runner in (
+        race.get(
+            "runners"
+        )
+        or []
+    ):
+
+        quotes = fresh_quotes(
+            runner
+        )
+
+        if not quotes:
+            continue
+
+        rows.append(
+            {
+                "number":
+                    runner.get(
+                        "number"
+                    ),
+
+                "name":
+                    str(
+                        runner.get(
+                            "name"
+                        )
+                        or
+                        "Unknown Runner"
+                    ),
+
+                "box":
+                    (
+                        runner.get(
+                            "barrier"
+                        )
+
+                        if runner.get(
+                            "barrier"
+                        )
+                        is not None
+
+                        else
+
+                        runner.get(
+                            "box"
+                        )
+                    ),
+
+                "form":
+                    runner.get(
+                        "form"
+                    ),
+
+                "form_score":
+                    form_score(
+                        runner.get(
+                            "form"
+                        )
+                    ),
+
+                "quotes":
+                    quotes,
+            }
+        )
+
+    return rows
+
+
+# ============================================================
+# FAIR MARKET PROBABILITIES
+# ============================================================
+
+def fair_market_probabilities(
+    runners
+):
+
+    n = len(
+        runners
+    )
+
+    by_book = {}
+
+    for runner_index, runner in enumerate(
         runners
     ):
 
-        for q in runner[
+        for quote in runner[
             "quotes"
         ]:
 
-            markets.setdefault(
-                q["key"],
+            by_book.setdefault(
+                quote[
+                    "key"
+                ],
                 {}
-            )[i] = q[
+            )[
+                runner_index
+            ] = quote[
                 "price"
             ]
 
-    fair_samples = {
+    samples = {
 
         i: []
 
-        for i in range(
-            len(runners)
-        )
-
+        for i
+        in range(n)
     }
 
-    for _, prices in markets.items():
+    # De-vig every bookmaker market separately.
 
-        # Ignore badly incomplete bookmaker markets.
+    for prices in by_book.values():
+
         if (
             len(prices)
             /
-            len(runners)
+            n
             <
-            .70
+            0.70
         ):
             continue
 
         implied = {
 
             i:
-                1 / p
+                1 / price
 
-            for i, p
+            for i, price
             in prices.items()
-
         }
 
         total = sum(
             implied.values()
         )
 
-        for i, p in implied.items():
+        if total <= 0:
+            continue
 
-            fair_samples[i].append(
-                p / total
+        for i, probability in (
+            implied.items()
+        ):
+
+            samples[i].append(
+                probability
+                /
+                total
             )
 
-    market_raw = []
+    raw = []
 
     for i, runner in enumerate(
         runners
     ):
 
-        if fair_samples[i]:
+        if samples[i]:
 
-            market_raw.append(
+            raw.append(
 
                 statistics.median(
-                    fair_samples[i]
+                    samples[i]
                 )
 
             )
 
         else:
 
-            market_raw.append(
-
-                1
-                /
+            median_price = (
                 statistics.median(
 
-                    q["price"]
+                    quote[
+                        "price"
+                    ]
 
-                    for q
+                    for quote
                     in runner[
                         "quotes"
                     ]
-
                 )
+            )
 
+            raw.append(
+                1
+                /
+                median_price
             )
 
     total = sum(
-        market_raw
+        raw
     )
 
-    market_p = [
+    if total <= 0:
 
-        p / total
+        return (
+            None,
+            None
+        )
 
-        for p
-        in market_raw
+    probabilities = [
 
+        value
+        /
+        total
+
+        for value
+        in raw
     ]
+
+    return (
+        probabilities,
+        samples
+    )
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+def analyse_race(
+    race,
+    mover_index,
+    mode
+):
+
+    runners = runner_rows(
+        race
+    )
+
+    if len(
+        runners
+    ) < 2:
+
+        return None
+
+    market_probs, fair_samples = (
+        fair_market_probabilities(
+            runners
+        )
+    )
+
+    if not market_probs:
+        return None
 
     form_raw = [
 
         max(
-            .05,
-            r[
+            0.05,
+            runner[
                 "form_score"
             ]
         )
 
-        for r
+        for runner
         in runners
-
     ]
 
-    total = sum(
+    form_total = sum(
         form_raw
     )
 
-    form_p = [
+    form_probs = [
 
-        p / total
+        value
+        /
+        form_total
 
-        for p
+        for value
         in form_raw
-
     ]
 
     raw_model = []
@@ -627,123 +905,126 @@ def analyse(
         runners
     ):
 
-        # Market remains the dominant predictor.
-        base = (
-            .85
-            *
-            market_p[i]
-            +
-            .15
-            *
-            form_p[i]
-        )
+        if mode == "full":
 
-        move = mover_index.get(
+            # Market remains the dominant signal.
 
-            mkey(
+            base = (
 
-                race.get(
-                    "venue"
-                ),
-
-                race.get(
-                    "race_number"
-                ),
-
-                runner[
-                    "name"
-                ]
-
-            )
-
-        )
-
-        move_pct = (
-
-            num(
-                move.get(
-                    "move_pct"
-                )
-            )
-
-            if move
-
-            else None
-
-        )
-
-        # PuntersEdge:
-        # negative move = firming
-        # positive move = drifting
-
-        move_signal = (
-
-            0
-
-            if move_pct is None
-
-            else max(
-
-                -1,
-
-                min(
-
-                    1,
-
-                    -move_pct
-                    /
-                    20
-
-                )
-
-            )
-
-        )
-
-        raw_model.append(
-
-            base
-            *
-            (
-                1
-                +
-                .08
+                0.84
                 *
-                move_signal
+                market_probs[i]
+
+                +
+
+                0.16
+                *
+                form_probs[i]
             )
 
-        )
+            movement = (
+                mover_index.get(
 
-        runner[
-            "move_pct"
-        ] = move_pct
+                    mover_key(
 
-        runner[
-            "move_direction"
-        ] = (
+                        race.get(
+                            "venue"
+                        ),
 
-            move.get(
-                "direction"
+                        race.get(
+                            "race_number"
+                        ),
+
+                        runner[
+                            "name"
+                        ]
+                    )
+                )
             )
 
-            if move
+            move = mover_pct(
+                movement
+            )
 
-            else None
+            runner[
+                "move_pct"
+            ] = move
 
-        )
+            if move is None:
+
+                multiplier = 1.0
+
+            else:
+
+                # PuntersEdge:
+                # negative = firming
+                # positive = drifting
+
+                signal = max(
+
+                    -1.0,
+
+                    min(
+
+                        1.0,
+
+                        -move
+                        /
+                        20.0
+                    )
+                )
+
+                multiplier = (
+
+                    1.0
+
+                    +
+
+                    0.06
+                    *
+                    signal
+                )
+
+            raw_model.append(
+
+                base
+                *
+                multiplier
+            )
+
+        else:
+
+            # International fallback.
+            # Market only.
+
+            runner[
+                "move_pct"
+            ] = None
+
+            raw_model.append(
+                market_probs[i]
+            )
 
     total = sum(
         raw_model
     )
 
+    if total <= 0:
+        return None
+
     probs = [
 
-        p / total
+        value
+        /
+        total
 
-        for p
+        for value
         in raw_model
-
     ]
+
+    # ========================================================
+    # ADD PRICE INFORMATION
+    # ========================================================
 
     for i, runner in enumerate(
         runners
@@ -755,57 +1036,74 @@ def analyse(
                 "quotes"
             ],
 
-            key=lambda q:
-                q[
+            key=lambda quote:
+                quote[
                     "price"
-                ]
-
+                ],
         )
 
-        sb = next(
+        sportsbet = next(
 
             (
-                q
 
-                for q
+                quote
+
+                for quote
                 in runner[
                     "quotes"
                 ]
 
-                if sportsbet(
-                    q[
+                if is_sportsbet(
+
+                    quote[
                         "key"
+                    ]
+
+                    +
+
+                    " "
+
+                    +
+
+                    quote[
+                        "name"
                     ]
                 )
             ),
 
-            None
-
+            None,
         )
 
         ages = [
 
-            q[
+            quote[
                 "age"
             ]
 
-            for q
+            for quote
             in runner[
                 "quotes"
             ]
 
-            if q[
+            if quote[
                 "age"
-            ] is not None
-
+            ]
+            is not None
         ]
+
+        samples = (
+            fair_samples.get(
+                i,
+                []
+            )
+        )
 
         runner[
             "prob"
         ] = probs[i]
 
         runner[
-            "fair"
+            "fair_price"
         ] = (
             1
             /
@@ -813,7 +1111,7 @@ def analyse(
         )
 
         runner[
-            "best"
+            "best_price"
         ] = best[
             "price"
         ]
@@ -825,21 +1123,20 @@ def analyse(
         ]
 
         runner[
-            "sportsbet"
+            "sportsbet_price"
         ] = (
 
-            sb[
+            sportsbet[
                 "price"
             ]
 
-            if sb
+            if sportsbet
 
             else None
-
         )
 
         runner[
-            "books"
+            "book_count"
         ] = len(
             runner[
                 "quotes"
@@ -847,7 +1144,7 @@ def analyse(
         )
 
         runner[
-            "age"
+            "mean_age"
         ] = (
 
             statistics.mean(
@@ -857,48 +1154,51 @@ def analyse(
             if ages
 
             else None
-
         )
 
         runner[
-            "edge"
-        ] = (
-
-            probs[i]
-            *
-            best[
-                "price"
-            ]
-            -
-            1
-
-        ) * 100
-
-        runner[
-            "sd"
+            "book_probability_sd"
         ] = (
 
             statistics.pstdev(
-                fair_samples[i]
+                samples
             )
 
             if len(
-                fair_samples[i]
+                samples
             ) > 1
 
-            else .10
+            else None
+        )
 
+        runner[
+            "model_edge_pct"
+        ] = (
+
+            (
+                probs[i]
+                *
+                best[
+                    "price"
+                ]
+
+                -
+
+                1
+            )
+
+            *
+            100
         )
 
     runners.sort(
 
-        key=lambda r:
-            r[
+        key=lambda runner:
+            runner[
                 "prob"
             ],
 
-        reverse=True
-
+        reverse=True,
     )
 
     winner = runners[0]
@@ -909,135 +1209,289 @@ def analyse(
         winner[
             "prob"
         ]
+
         -
+
         second[
             "prob"
         ]
-
     )
 
-    coverage = min(
+    # ========================================================
+    # FULL AU/NZ CONFIDENCE
+    # ========================================================
 
-        1,
+    if mode == "full":
 
-        winner[
-            "books"
-        ]
-        /
-        8
+        coverage = min(
 
-    )
+            1.0,
 
-    freshness = (
-
-        1
-
-        if winner[
-            "age"
-        ] is None
-
-        else max(
-
-            0,
-
-            1
-            -
             winner[
-                "age"
+                "book_count"
             ]
             /
-            120
-
+            8.0
         )
 
-    )
+        freshness = (
 
-    agreement = max(
+            0.75
 
-        0,
+            if winner[
+                "mean_age"
+            ]
+            is None
 
-        1
-        -
-        winner[
-            "sd"
-        ]
-        /
-        .08
-
-    )
-
-    confidence = (
-
-        30
-
-        +
-        winner[
-            "prob"
-        ]
-        *
-        55
-
-        +
-        gap
-        *
-        80
-
-        +
-        coverage
-        *
-        8
-
-        +
-        freshness
-        *
-        5
-
-        +
-        agreement
-        *
-        4
-
-    )
-
-    confidence = int(
-
-        round(
+            else
 
             max(
 
-                45,
+                0.0,
 
-                min(
-                    92,
-                    confidence
-                )
+                1.0
 
+                -
+
+                winner[
+                    "mean_age"
+                ]
+                /
+                120.0
             )
-
         )
 
-    )
+        agreement = (
 
-    verdict = (
+            0.45
 
-        "STRONG PICK"
+            if winner[
+                "book_probability_sd"
+            ]
+            is None
 
-        if confidence >= 80
+            else
 
-        else "GOOD PICK"
+            max(
 
-        if confidence >= 70
+                0.0,
 
-        else "LEAN"
+                min(
 
-        if confidence >= 60
+                    1.0,
 
-        else "LOW CONFIDENCE"
+                    1.0
 
-    )
+                    -
+
+                    winner[
+                        "book_probability_sd"
+                    ]
+                    /
+                    0.08
+                )
+            )
+        )
+
+        has_form = (
+
+            winner[
+                "form"
+            ]
+
+            not in (
+                None,
+                "",
+                []
+            )
+        )
+
+        confidence = (
+
+            34
+
+            +
+
+            winner[
+                "prob"
+            ]
+            *
+            48
+
+            +
+
+            gap
+            *
+            75
+
+            +
+
+            coverage
+            *
+            8
+
+            +
+
+            freshness
+            *
+            4
+
+            +
+
+            agreement
+            *
+            4
+
+            +
+
+            (
+                3
+                if has_form
+                else 0
+            )
+        )
+
+        confidence = int(
+
+            round(
+
+                max(
+
+                    48,
+
+                    min(
+                        90,
+                        confidence
+                    )
+                )
+            )
+        )
+
+        if confidence >= 80:
+            verdict = "STRONG PICK"
+
+        elif confidence >= 70:
+            verdict = "GOOD PICK"
+
+        elif confidence >= 60:
+            verdict = "LEAN"
+
+        else:
+            verdict = "LOW CONFIDENCE"
+
+        strength = (
+
+            confidence
+
+            +
+
+            min(
+
+                5,
+
+                winner[
+                    "book_count"
+                ]
+                *
+                0.45
+            )
+
+            +
+
+            min(
+
+                5,
+
+                gap
+                *
+                35
+            )
+        )
+
+    # ========================================================
+    # INTERNATIONAL CONFIDENCE
+    # ========================================================
+
+    else:
+
+        coverage = min(
+
+            1.0,
+
+            winner[
+                "book_count"
+            ]
+            /
+            3.0
+        )
+
+        confidence = (
+
+            34
+
+            +
+
+            winner[
+                "prob"
+            ]
+            *
+            30
+
+            +
+
+            gap
+            *
+            38
+
+            +
+
+            coverage
+            *
+            4
+        )
+
+        confidence = int(
+
+            round(
+
+                max(
+
+                    42,
+
+                    min(
+                        68,
+                        confidence
+                    )
+                )
+            )
+        )
+
+        verdict = (
+
+            "MARKET LEAN"
+
+            if winner[
+                "book_count"
+            ] >= 2
+
+            else
+
+            "LOW-DATA MARKET LEAN"
+        )
+
+        strength = (
+
+            confidence
+
+            +
+
+            min(
+                3,
+                gap * 25
+            )
+        )
 
     return {
-
         "race":
             race,
 
@@ -1054,120 +1508,79 @@ def analyse(
             verdict,
 
         "strength":
-            (
-                confidence
+            strength,
 
-                +
-                min(
-                    6,
-                    winner[
-                        "books"
-                    ]
-                    *
-                    .5
-                )
-
-                +
-                min(
-                    5,
-                    gap
-                    *
-                    35
-                )
-            )
-
+        "mode":
+            mode,
     }
 
 
-def title(result):
+# ============================================================
+# OUTPUT HELPERS
+# ============================================================
 
-    race = result[
-        "race"
-    ]
-
-    distance = (
-
-        f" · "
-        f"{race.get('distance_m')}m"
-
-        if race.get(
-            "distance_m"
-        )
-
-        else ""
-
-    )
+def price_text(value):
 
     return (
 
-        f"{race.get('venue') or 'Unknown venue'} "
-        f"R{race.get('race_number') or '?'}"
-        f"{distance} · "
-        f"{local_time(race.get('start_time'))}"
+        f"${value:.2f}"
 
+        if value
+        is not None
+
+        else
+
+        "No fresh quote"
     )
 
 
 def edge_label(edge):
 
     if edge >= 8:
-        return "POSITIVE MODEL EDGE"
+
+        return (
+            "POSITIVE MODEL/PRICE GAP"
+        )
 
     if edge >= 3:
-        return "SMALL MODEL EDGE"
 
-    return "NO MODEL EDGE"
+        return (
+            "SMALL MODEL/PRICE GAP"
+        )
+
+    return (
+        "NO MODEL/PRICE GAP"
+    )
 
 
-def markdown(
+# ============================================================
+# GITHUB MARKDOWN SUMMARY
+# ============================================================
+
+def markdown_output(
     results,
-    movers_used
+    mode,
+    movers_available
 ):
 
     now = datetime.now(
 
         ZoneInfo(
-            TZ
+            BOT_TIMEZONE
         )
 
     ).strftime(
         "%d %b %Y, %I:%M %p %Z"
     )
 
+    # No title here because predict.yml
+    # already adds the V3 heading.
+
     lines = [
-
-        "# 🐕 Greyhound AI Predictor V3",
-
-        "",
 
         f"Generated **{now}**",
 
         "",
-
-        (
-            "Fresh bookmaker prices are "
-            "de-vigged into market probabilities, "
-            "then adjusted modestly for recent form"
-            +
-            (
-                " and confirmed market movement."
-
-                if movers_used
-
-                else "."
-            )
-        ),
-
-        "",
-
-        (
-            "> Estimated win chance is a model "
-            "estimate, not a guaranteed or "
-            "historically calibrated probability."
-        ),
-
-        "",
-
     ]
 
     if not results:
@@ -1175,105 +1588,247 @@ def markdown(
         return "\n".join(
 
             lines
+
             +
+
             [
                 (
-                    "## No suitable AU/NZ "
-                    "greyhound races found."
-                )
-            ]
+                    "## No usable upcoming "
+                    "greyhound races found"
+                ),
 
+                "",
+
+                (
+                    "The feed returned races, "
+                    "but none had enough fresh "
+                    "runner prices to build "
+                    "a prediction."
+                ),
+            ]
         )
 
     best = results[0]
-
-    w = best[
+    winner = best[
         "winner"
     ]
 
-    sb = (
+    # ========================================================
+    # FULL AU/NZ
+    # ========================================================
 
-        f"${w['sportsbet']:.2f}"
+    if mode == "full":
 
-        if w[
-            "sportsbet"
+        lines += [
+
+            "## 🇦🇺 FULL AU/NZ MODEL",
+
+            "",
+
+            (
+                "Uses fresh bookmaker prices "
+                "plus recent form. Market movement "
+                "is added when the optional movers "
+                "feed is available."
+            ),
+
+            "",
         ]
 
-        else
-        "No fresh quote"
+        if not movers_available:
 
-    )
+            lines += [
+
+                (
+                    "> Market movers were unavailable "
+                    "on this run, so the model continued "
+                    "without that adjustment."
+                ),
+
+                "",
+            ]
+
+        best_heading = (
+            "## 🏆 BEST AU/NZ PICK"
+        )
+
+    # ========================================================
+    # INTERNATIONAL FALLBACK
+    # ========================================================
+
+    else:
+
+        lines += [
+
+            (
+                "## 🌍 INTERNATIONAL FALLBACK "
+                "— MARKET ONLY"
+            ),
+
+            "",
+
+            (
+                "> No suitable AU/NZ race was in "
+                "the current next-to-go window. "
+                "Foreign racing usually has thinner "
+                "bookmaker coverage and no AU/NZ "
+                "form/box enrichment, so confidence "
+                "is capped."
+            ),
+
+            "",
+        ]
+
+        best_heading = (
+            "## 🏆 BEST INTERNATIONAL MARKET LEAN"
+        )
+
+    # ========================================================
+    # BEST PICK
+    # ========================================================
 
     lines += [
 
-        "## 🏆 BEST PICK FROM THIS SCAN",
+        best_heading,
 
         "",
 
         (
-            f"### #{w['number'] or '?'} "
-            f"**{w['name'].upper()}**"
+            f"### "
+            f"#{winner['number'] or '?'} "
+            f"**{winner['name'].upper()}**"
         ),
 
-        f"**{title(best)}**",
+        (
+            f"**"
+            f"{race_label(best['race'])}"
+            f"**"
+        ),
 
         "",
 
         (
             f"- **Estimated win chance:** "
-            f"{w['prob'] * 100:.1f}%"
+            f"{winner['prob'] * 100:.1f}%"
         ),
 
         (
-            f"- **Model confidence:** "
-            f"{best['confidence']}/100 — "
-            f"**{best['verdict']}**"
+            f"- **Confidence index:** "
+            f"{best['confidence']}/100 "
+            f"— **{best['verdict']}**"
         ),
 
         (
             f"- **Sportsbet:** "
-            f"{sb}"
+            f"{price_text(winner['sportsbet_price'])}"
         ),
 
         (
             f"- **Best available:** "
-            f"${w['best']:.2f} "
-            f"({w['best_book']})"
+            f"${winner['best_price']:.2f} "
+            f"({winner['best_book']})"
         ),
 
         (
-            f"- **Model fair price:** "
-            f"${w['fair']:.2f}"
+            f"- **Market/model fair price:** "
+            f"${winner['fair_price']:.2f}"
         ),
 
         (
-            f"- **Model edge at best price:** "
-            f"{w['edge']:+.1f}% — "
-            f"**{edge_label(w['edge'])}**"
+            f"- **Fresh bookmaker quotes:** "
+            f"{winner['book_count']}"
         ),
-
-        (
-            f"- **Box:** "
-            f"{w['box'] if w['box'] is not None else 'N/A'} "
-            f"· **Form:** "
-            f"`{form_text(w['form'])}`"
-        ),
-
     ]
 
-    if w[
-        "move_pct"
-    ] is not None:
+    # ========================================================
+    # EXTRA AU/NZ INFORMATION
+    # ========================================================
 
-        lines.append(
+    if mode == "full":
+
+        lines += [
 
             (
-                f"- **Market move:** "
-                f"{w['move_pct']:+.1f}% "
-                f"({w['move_direction'] or 'movement'})"
+                f"- **Box:** "
+                f"{winner['box'] "
+                f"if winner['box'] is not None "
+                f"else 'N/A'}"
+            ),
+
+            (
+                f"- **Recent form:** "
+                f"`{form_text(winner['form'])}`"
+            ),
+
+            (
+                f"- **Price vs model:** "
+                f"{winner['model_edge_pct']:+.1f}% "
+                f"— **"
+                f"{edge_label(winner['model_edge_pct'])}"
+                f"**"
+            ),
+        ]
+
+        if winner[
+            "move_pct"
+        ] is not None:
+
+            direction = (
+
+                "firming"
+
+                if winner[
+                    "move_pct"
+                ] < 0
+
+                else
+
+                "drifting"
+
+                if winner[
+                    "move_pct"
+                ] > 0
+
+                else
+
+                "flat"
             )
 
-        )
+            lines.append(
+
+                (
+                    f"- **Market move:** "
+                    f"{winner['move_pct']:+.1f}% "
+                    f"({direction})"
+                )
+            )
+
+    # ========================================================
+    # INTERNATIONAL DATA WARNING
+    # ========================================================
+
+    else:
+
+        lines += [
+
+            (
+                f"- **Data quality:** "
+                f"{'Multi-book market' "
+                f"if winner['book_count'] >= 2 "
+                f"else 'Single-book market'}"
+            ),
+
+            (
+                "- **Value signal:** Not shown for "
+                "international fallback because the "
+                "model is derived almost entirely "
+                "from those same market prices."
+            ),
+        ]
+
+    # ========================================================
+    # RANKED RACES
+    # ========================================================
 
     lines += [
 
@@ -1283,81 +1838,115 @@ def markdown(
 
         "",
 
-        "## 📊 All races ranked strongest → weakest",
+        (
+            "## 📊 RACES RANKED "
+            "STRONGEST → WEAKEST"
+        ),
 
         "",
-
     ]
 
-    for n, result in enumerate(
+    for position, result in enumerate(
         results,
         1
     ):
 
-        w = result[
+        race = result[
+            "race"
+        ]
+
+        winner = result[
             "winner"
         ]
 
-        sb = (
-
-            f"${w['sportsbet']:.2f}"
-
-            if w[
-                "sportsbet"
-            ]
-
-            else "N/A"
-
-        )
-
         lines += [
 
-            f"### {n}. {title(result)}",
+            (
+                f"### {position}. "
+                f"{race_label(race)}"
+            ),
 
             (
-                f"🏆 **#{w['number'] or '?'} "
-                f"{w['name']}** — "
-                f"{w['prob'] * 100:.1f}% · "
-                f"**{result['confidence']}/100 "
-                f"{result['verdict']}**"
+                f"🏆 **"
+                f"#{winner['number'] or '?'} "
+                f"{winner['name']}"
+                f"**"
             ),
 
             "",
 
             (
-                f"Sportsbet **{sb}** · "
-                f"Best **${w['best']:.2f} "
-                f"{w['best_book']}** · "
-                f"Fair **${w['fair']:.2f}** · "
-                f"Edge **{w['edge']:+.1f}%**"
+                f"**Win estimate:** "
+                f"{winner['prob'] * 100:.1f}% "
+                f"· **Confidence:** "
+                f"{result['confidence']}/100 "
+                f"· **{result['verdict']}**"
             ),
 
             "",
 
-            "**Top 3:**",
+            (
+                f"Sportsbet **"
+                f"{price_text(winner['sportsbet_price'])}"
+                f"** · "
+                f"Best **"
+                f"${winner['best_price']:.2f} "
+                f"({winner['best_book']})"
+                f"** · "
+                f"Fair **"
+                f"${winner['fair_price']:.2f}"
+                f"**"
+            ),
 
+            "",
+
+            "**Top 3**",
         ]
 
-        for pos, r in enumerate(
+        for rank, runner in enumerate(
             result[
                 "top3"
             ],
             1
         ):
 
+            extra = ""
+
+            if mode == "full":
+
+                box = (
+
+                    runner[
+                        "box"
+                    ]
+
+                    if runner[
+                        "box"
+                    ]
+                    is not None
+
+                    else "N/A"
+                )
+
+                extra = (
+
+                    f" · box {box} "
+                    f"· form "
+                    f"`{form_text(runner['form'])}`"
+                )
+
             lines.append(
 
                 (
-                    f"{pos}. "
-                    f"**#{r['number'] or '?'} "
-                    f"{r['name']}** — "
-                    f"{r['prob'] * 100:.1f}% · "
-                    f"best ${r['best']:.2f} · "
-                    f"form `{form_text(r['form'])}` · "
-                    f"box "
-                    f"{r['box'] if r['box'] is not None else 'N/A'}"
+                    f"{rank}. "
+                    f"**#{runner['number'] or '?'} "
+                    f"{runner['name']}** "
+                    f"— "
+                    f"{runner['prob'] * 100:.1f}% "
+                    f"· best "
+                    f"${runner['best_price']:.2f}"
+                    f"{extra}"
                 )
-
             )
 
         lines += [
@@ -1367,30 +1956,37 @@ def markdown(
             "---",
 
             "",
-
         ]
 
     lines += [
 
         "### Model notes",
 
+        "",
+
         (
-            "- Stale bookmaker quotes "
-            "are excluded."
+            "- Quotes marked stale, or older "
+            "than 120 seconds, are excluded."
         ),
 
         (
-            "- Box is shown but not given a "
-            "generic advantage; a proper box "
-            "edge needs track-and-distance history."
+            "- The probability figure is a model "
+            "estimate, not a guaranteed or historically "
+            "calibrated win probability."
         ),
 
         (
-            "- A positive model edge is not a "
-            "guarantee of profit. Backtesting "
-            "is the next step."
+            "- Box is displayed for AU/NZ races but "
+            "is not given a generic bonus; a useful "
+            "box effect needs track-and-distance-specific "
+            "history."
         ),
 
+        (
+            "- International fallback is intentionally "
+            "lower confidence because foreign markets "
+            "commonly have much thinner coverage."
+        ),
     ]
 
     return "\n".join(
@@ -1398,42 +1994,63 @@ def markdown(
     )
 
 
-def text_output(results):
+# ============================================================
+# PLAIN TEXT OUTPUT
+# ============================================================
+
+def text_output(
+    results,
+    mode
+):
 
     if not results:
 
         return (
-            "GREYHOUND AI PREDICTOR V3\n"
-            "No suitable AU/NZ greyhound races found.\n"
+            "GREYHOUND AI PREDICTOR V3.1\n"
+            "No usable upcoming greyhound races found.\n"
         )
 
     best = results[0]
-
-    w = best[
+    winner = best[
         "winner"
     ]
 
+    mode_text = (
+
+        "FULL AU/NZ MODEL"
+
+        if mode == "full"
+
+        else
+
+        "INTERNATIONAL MARKET-ONLY FALLBACK"
+    )
+
     lines = [
 
-        "GREYHOUND AI PREDICTOR V3",
+        "GREYHOUND AI PREDICTOR V3.1",
+
+        mode_text,
 
         "",
 
-        "BEST PICK FROM THIS SCAN",
+        "BEST PICK",
 
-        title(
-            best
+        race_label(
+            best[
+                "race"
+            ]
         ),
 
         (
             f"WINNER: "
-            f"#{w['number'] or '?'} "
-            f"{w['name']}"
+            f"#{winner['number'] or '?'} "
+            f"{winner['name']}"
         ),
 
         (
             f"Estimated win chance: "
-            f"{w['prob'] * 100:.1f}%"
+            f"{winner['prob'] * 100:.1f}%"
         ),
 
         (
@@ -1444,57 +2061,47 @@ def text_output(results):
 
         (
             f"Sportsbet: "
-            f"${w['sportsbet']:.2f}"
-
-            if w[
-                "sportsbet"
-            ]
-
-            else "Sportsbet: N/A"
+            f"{price_text(winner['sportsbet_price'])}"
         ),
 
         (
             f"Best available: "
-            f"${w['best']:.2f} "
-            f"({w['best_book']})"
+            f"${winner['best_price']:.2f} "
+            f"({winner['best_book']})"
         ),
 
         (
             f"Fair price: "
-            f"${w['fair']:.2f}"
-        ),
-
-        (
-            f"Model edge: "
-            f"{w['edge']:+.1f}%"
+            f"${winner['fair_price']:.2f}"
         ),
 
         "",
 
         "RANKED PICKS",
-
     ]
 
-    for n, result in enumerate(
+    for position, result in enumerate(
         results,
         1
     ):
 
-        x = result[
+        runner = result[
             "winner"
         ]
 
         lines.append(
 
             (
-                f"{n}. "
-                f"{title(result)} | "
-                f"#{x['number'] or '?'} "
-                f"{x['name']} | "
-                f"{x['prob'] * 100:.1f}% | "
+                f"{position}. "
+                f"{race_label(result['race'])} "
+                f"| "
+                f"#{runner['number'] or '?'} "
+                f"{runner['name']} "
+                f"| "
+                f"{runner['prob'] * 100:.1f}% "
+                f"| "
                 f"{result['confidence']}/100"
             )
-
         )
 
     return (
@@ -1506,117 +2113,44 @@ def text_output(results):
     )
 
 
-def main():
+# ============================================================
+# JSON OUTPUT
+# ============================================================
 
-    print(
-        "🐕 GREYHOUND AI PREDICTOR V3"
-    )
+def json_output(
+    results,
+    mode
+):
 
-    print(
-        "Prediction-only: "
-        "this program does not place bets."
-    )
+    output = []
 
-    try:
+    for result in results:
 
-        races, movers = fetch_data()
-
-        mover_index = {
-
-            mkey(
-                m.get("venue"),
-                m.get("race_number"),
-                m.get("runner")
-            ):
-                m
-
-            for m
-            in movers
-
-            if isinstance(
-                m,
-                dict
-            )
-
-        }
-
-        results = []
-
-        for race in races:
-
-            if local_race(
-                race
-            ):
-
-                r = analyse(
-                    race,
-                    mover_index
-                )
-
-                if r:
-                    results.append(
-                        r
-                    )
-
-        results.sort(
-
-            key=lambda r:
-                r[
-                    "strength"
-                ],
-
-            reverse=True
-
-        )
-
-        results = results[
-            :MAX_RACES
+        race = result[
+            "race"
         ]
 
-        Path(
-            "predictions.md"
-        ).write_text(
+        winner = result[
+            "winner"
+        ]
 
-            markdown(
-                results,
-                bool(movers)
-            )
-            +
-            "\n",
+        output.append(
 
-            encoding="utf-8"
-
-        )
-
-        Path(
-            "predictions.txt"
-        ).write_text(
-
-            text_output(
-                results
-            ),
-
-            encoding="utf-8"
-
-        )
-
-        out = []
-
-        for r in results:
-
-            race = r[
-                "race"
-            ]
-
-            w = r[
-                "winner"
-            ]
-
-            out.append({
+            {
+                "mode":
+                    mode,
 
                 "race_id":
-                    race.get(
-                        "race_id"
+                    (
+                        race.get(
+                            "race_id"
+                        )
+
+                        or
+
+                        race.get(
+                            "id"
+                        )
                     ),
 
                 "venue":
@@ -1629,6 +2163,11 @@ def main():
                         "race_number"
                     ),
 
+                "country":
+                    race.get(
+                        "country"
+                    ),
+
                 "start_time":
                     race.get(
                         "start_time"
@@ -1639,118 +2178,289 @@ def main():
                         "distance_m"
                     ),
 
-                "winner": {
-
-                    "number":
-                        w[
-                            "number"
-                        ],
-
-                    "name":
-                        w[
-                            "name"
-                        ],
-
-                    "estimated_win_probability":
-                        round(
-                            w[
-                                "prob"
+                "prediction":
+                    {
+                        "number":
+                            winner[
+                                "number"
                             ],
-                            4
-                        ),
 
-                    "fair_price":
-                        round(
-                            w[
-                                "fair"
+                        "name":
+                            winner[
+                                "name"
                             ],
-                            2
-                        ),
 
-                    "sportsbet_price":
-                        w[
-                            "sportsbet"
-                        ],
+                        "estimated_win_probability":
+                            round(
+                                winner[
+                                    "prob"
+                                ],
+                                4
+                            ),
 
-                    "best_price":
-                        round(
-                            w[
-                                "best"
+                        "confidence_index":
+                            result[
+                                "confidence"
                             ],
-                            2
-                        ),
 
-                    "best_bookmaker":
-                        w[
-                            "best_book"
-                        ],
-
-                    "model_edge_pct":
-                        round(
-                            w[
-                                "edge"
+                        "verdict":
+                            result[
+                                "verdict"
                             ],
-                            2
-                        ),
 
-                    "box":
-                        w[
-                            "box"
-                        ],
+                        "sportsbet_price":
+                            winner[
+                                "sportsbet_price"
+                            ],
 
-                    "form":
-                        form_text(
-                            w[
-                                "form"
-                            ]
-                        ),
+                        "best_price":
+                            round(
+                                winner[
+                                    "best_price"
+                                ],
+                                2
+                            ),
 
-                },
+                        "best_bookmaker":
+                            winner[
+                                "best_book"
+                            ],
 
-                "confidence_index":
-                    r[
-                        "confidence"
-                    ],
+                        "fair_price":
+                            round(
+                                winner[
+                                    "fair_price"
+                                ],
+                                2
+                            ),
 
-                "verdict":
-                    r[
-                        "verdict"
-                    ],
+                        "fresh_bookmaker_quotes":
+                            winner[
+                                "book_count"
+                            ],
 
-            })
+                        "box":
+                            winner[
+                                "box"
+                            ],
 
-        save(
-            "predictions.json",
-            out
+                        "form":
+                            form_text(
+                                winner[
+                                    "form"
+                                ]
+                            ),
+
+                        "market_move_pct":
+                            winner[
+                                "move_pct"
+                            ],
+
+                        "model_price_gap_pct":
+                            round(
+                                winner[
+                                    "model_edge_pct"
+                                ],
+                                2
+                            ),
+                    },
+            }
         )
 
-        print(
-            text_output(
-                results
+    return output
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "🐕 GREYHOUND AI PREDICTOR V3.1"
+    )
+
+    print(
+        "Prediction-only: "
+        "this program does not place bets."
+    )
+
+    try:
+
+        races, movers = fetch_data()
+
+        mover_index = (
+            build_mover_index(
+                movers
             )
         )
 
-        return 0
+        full_results = []
+        fallback_results = []
 
-    except Exception as e:
+        # ====================================================
+        # ANALYSE EVERY UPCOMING RACE
+        # ====================================================
 
-        msg = (
-            f"ERROR: "
-            f"{e}"
+        for race in races:
+
+            if not isinstance(
+                race,
+                dict
+            ):
+                continue
+
+            if enriched_race(
+                race
+            ):
+
+                result = analyse_race(
+
+                    race,
+
+                    mover_index,
+
+                    "full"
+                )
+
+                if result:
+
+                    full_results.append(
+                        result
+                    )
+
+            else:
+
+                result = analyse_race(
+
+                    race,
+
+                    mover_index,
+
+                    "market"
+                )
+
+                if result:
+
+                    fallback_results.append(
+                        result
+                    )
+
+        # ====================================================
+        # AU/NZ ALWAYS HAS PRIORITY
+        # ====================================================
+
+        if full_results:
+
+            mode = "full"
+
+            full_results.sort(
+
+                key=lambda result:
+                    result[
+                        "strength"
+                    ],
+
+                reverse=True,
+            )
+
+            results = (
+                full_results[
+                    :MAX_DISPLAY
+                ]
+            )
+
+        # ====================================================
+        # NO AU/NZ? USE INTERNATIONAL FALLBACK
+        # ====================================================
+
+        else:
+
+            mode = "market"
+
+            fallback_results.sort(
+
+                key=lambda result:
+                    result[
+                        "strength"
+                    ],
+
+                reverse=True,
+            )
+
+            results = (
+                fallback_results[
+                    :MAX_DISPLAY
+                ]
+            )
+
+        # ====================================================
+        # SAVE OUTPUT
+        # ====================================================
+
+        markdown = markdown_output(
+
+            results,
+
+            mode,
+
+            bool(
+                movers
+            )
         )
 
-        print(
-            msg
+        Path(
+            "predictions.md"
+        ).write_text(
+
+            markdown
+            +
+            "\n",
+
+            encoding="utf-8",
         )
 
         Path(
             "predictions.txt"
         ).write_text(
 
-            msg + "\n",
+            text_output(
+                results,
+                mode
+            ),
 
-            encoding="utf-8"
+            encoding="utf-8",
+        )
 
+        save_json(
+
+            "predictions.json",
+
+            json_output(
+                results,
+                mode
+            )
+        )
+
+        print(
+
+            text_output(
+                results,
+                mode
+            )
+        )
+
+        return 0
+
+    except Exception as error:
+
+        message = (
+            f"ERROR: "
+            f"{error}"
+        )
+
+        print(
+            message
         )
 
         Path(
@@ -1758,19 +2468,31 @@ def main():
         ).write_text(
 
             (
-                "# Predictor error\n\n"
-                f"`{msg}`\n"
+                "## Predictor error\n\n"
+                f"`{message}`\n"
             ),
 
-            encoding="utf-8"
-
+            encoding="utf-8",
         )
 
-        save(
+        Path(
+            "predictions.txt"
+        ).write_text(
+
+            message
+            +
+            "\n",
+
+            encoding="utf-8",
+        )
+
+        save_json(
+
             "predictions.json",
+
             {
                 "error":
-                    str(e)
+                    str(error)
             }
         )
 
