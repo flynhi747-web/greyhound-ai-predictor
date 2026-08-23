@@ -27,15 +27,14 @@ jobs:
 
       - name: Install requirements
         run: pip install -r requirements.txt
+- name: Run predictor
+  env:
+    BOT_TIMEZONE: Australia/Brisbane
+    MAX_RACES: ${{ github.event.inputs.max_races || '8' }}
+    PUNTERSEDGE_API_KEY: ${{ secrets.PUNTERSEDGE_API_KEY }}
 
-      - name: Run predictor
-        env:
-          BOT_TIMEZONE: Australia/Brisbane
-          TAB_JURISDICTION: NSW
-          MAX_RACES: ${{ github.event.inputs.max_races || '8' }}
-          PUNTERSEDGE_API_KEY: ${{ secrets.PUNTERSEDGE_API_KEY }}
-        run: python predictor.py
-
+  run: python predictor_v2.py
+     
       - name: Put predictions in GitHub summary
         if: always()
         shell: bash
