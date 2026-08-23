@@ -1,10 +1,10 @@
-name: Greyhound Winner Predictor
+name: Greyhound Winner Predictor V3
 
 on:
   workflow_dispatch:
     inputs:
       max_races:
-        description: "Number of upcoming greyhound races to predict"
+        description: "Number of strongest upcoming races to display"
         required: false
         default: "8"
 
@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   predict:
+    name: Run Greyhound Predictor V3
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -26,35 +27,43 @@ jobs:
           python-version: "3.12"
 
       - name: Install requirements
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run predictor
+      - name: Run V3 predictor
         env:
           BOT_TIMEZONE: Australia/Brisbane
-          MAX_RACES: ${{ github.event.inputs.max_races || '8' }}
+          MAX_RACES: ${{ github.event.inputs.max_races }}
           PUNTERSEDGE_API_KEY: ${{ secrets.PUNTERSEDGE_API_KEY }}
         run: python predictor_v3.py
 
-      - name: Put predictions in GitHub summary
+      - name: Create prediction summary
         if: always()
         shell: bash
         run: |
-          if [ -f predictions.txt ]; then
-            {
-              echo '```text'
-              cat predictions.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          echo "# 🐕 Greyhound AI Predictor V3" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f predictions.md ]; then
+            cat predictions.md >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f predictions.txt ]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat predictions.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No predictions file produced. Open the Run predictor step for the error." >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ No predictions were produced." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Open the **Run V3 predictor** step above to see the error." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload results and debug data
+      - name: Upload prediction results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: greyhound-predictions
+          name: greyhound-predictions-v3
           path: |
+            predictions.md
             predictions.txt
             predictions.json
             debug/
