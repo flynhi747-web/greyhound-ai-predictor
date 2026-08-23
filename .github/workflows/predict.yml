@@ -1,1 +1,62 @@
+name: Greyhound Winner Predictor
 
+on:
+  workflow_dispatch:
+    inputs:
+      max_races:
+        description: "Number of upcoming greyhound races to predict"
+        required: false
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run predictor
+        env:
+          BOT_TIMEZONE: Australia/Brisbane
+          TAB_JURISDICTION: NSW
+          MAX_RACES: ${{ github.event.inputs.max_races || '8' }}
+        run: python predictor.py
+
+      - name: Put predictions in GitHub summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f predictions.txt ]; then
+            {
+              echo '```text'
+              cat predictions.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No predictions file produced. Open the Run predictor step for the error." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results and debug data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: greyhound-predictions
+          path: |
+            predictions.txt
+            predictions.json
+            debug/
+          if-no-files-found: ignore
+          retention-days: 7
